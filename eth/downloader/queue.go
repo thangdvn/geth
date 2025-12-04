@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 const (
@@ -69,7 +70,7 @@ type fetchResult struct {
 	Header       *types.Header
 	Uncles       []*types.Header
 	Transactions types.Transactions
-	Receipts     types.Receipts
+	Receipts     rlp.RawValue
 	Withdrawals  types.Withdrawals
 }
 
@@ -82,8 +83,13 @@ func newFetchResult(header *types.Header, snapSync bool) *fetchResult {
 	} else if header.WithdrawalsHash != nil {
 		item.Withdrawals = make(types.Withdrawals, 0)
 	}
-	if snapSync && !header.EmptyReceipts() {
-		item.pending.Store(item.pending.Load() | (1 << receiptType))
+	if snapSync {
+		if header.EmptyReceipts() {
+			// Ensure the receipts list is valid even if it isn't actively fetched.
+			item.Receipts = rlp.EmptyList
+		} else {
+			item.pending.Store(item.pending.Load() | (1 << receiptType))
+		}
 	}
 	return item
 }
@@ -318,9 +324,7 @@ func (q *queue) Results(block bool) []*fetchResult {
 		for _, uncle := range result.Uncles {
 			size += uncle.Size()
 		}
-		for _, receipt := range result.Receipts {
-			size += receipt.Size()
-		}
+		size += common.StorageSize(len(result.Receipts))
 		for _, tx := range result.Transactions {
 			size += common.StorageSize(tx.Size())
 		}
@@ -414,7 +418,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 	skip := make([]*types.Header, 0)
 	progress := false
 	throttled := false
-	for proc := 0; len(send) < count && !taskQueue.Empty(); proc++ {
+	for len(send) < count && !taskQueue.Empty() {
 		// the task queue will pop items in order, so the highest prio block
 		// is also the lowest block number.
 		header, _ := taskQueue.Peek()
@@ -429,7 +433,6 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			taskQueue.PopItem()
 			progress = true
 			delete(taskPool, header.Hash())
-			proc = proc - 1
 			log.Error("Fetch reservation already delivered", "number", header.Number.Uint64())
 			continue
 		}
@@ -451,7 +454,6 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			// If it's a noop, we can skip this task
 			delete(taskPool, header.Hash())
 			taskQueue.PopItem()
-			proc = proc - 1
 			progress = true
 			continue
 		}
@@ -631,7 +633,7 @@ func (q *queue) DeliverBodies(id string, txLists [][]*types.Transaction, txListH
 // DeliverReceipts injects a receipt retrieval response into the results queue.
 // The method returns the number of transaction receipts accepted from the delivery
 // and also wakes any threads waiting for data delivery.
-func (q *queue) DeliverReceipts(id string, receiptList [][]*types.Receipt, receiptListHashes []common.Hash) (int, error) {
+func (q *queue) DeliverReceipts(id string, receiptList []rlp.RawValue, receiptListHashes []common.Hash) (int, error) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
